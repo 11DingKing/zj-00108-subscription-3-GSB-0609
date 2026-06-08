@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+*.pid
+.DS_Store
+coverage/
+.turbo/
+data/*.db
+data/*.db-journal
+venv/
+__pycache__/
+*.pyc
+.mypy_cache/
