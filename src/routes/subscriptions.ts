@@ -239,7 +239,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
 
       const oldPlanPrice = subscription.plan.getActualPrice();
       const oldPlanDays = subscription.plan.getDurationDays();
-      const remainingValue = oldPlanPrice * (remainingDays / oldPlanDays);
+      const remainingValue = oldPlanDays > 0 ? oldPlanPrice * (remainingDays / oldPlanDays) : 0;
       const priceDiff = newPlan.getActualPrice() - remainingValue;
 
       if (priceDiff > 0) {
