@@ -4,6 +4,7 @@ import { Subscription, SubscriptionStatus } from "../entities/Subscription";
 import { Bill, BillStatus } from "../entities/Bill";
 import { Plan, PlanType } from "../entities/Plan";
 import { Coupon } from "../entities/Coupon";
+import { User } from "../entities/User";
 import { In, LessThan, MoreThan, Between } from "typeorm";
 
 export default async function billingRoutes(fastify: FastifyInstance) {
@@ -35,7 +36,10 @@ export default async function billingRoutes(fastify: FastifyInstance) {
         where: {
           endDate: LessThan(now),
           autoRenew: true,
-          status: In([SubscriptionStatus.ACTIVE, SubscriptionStatus.GRACE_PERIOD]),
+          status: In([
+            SubscriptionStatus.ACTIVE,
+            SubscriptionStatus.GRACE_PERIOD,
+          ]),
         },
         relations: ["user", "plan"],
       });
@@ -61,7 +65,10 @@ export default async function billingRoutes(fastify: FastifyInstance) {
 
       for (const subscription of expiredSubscriptions) {
         if (subscription.status === SubscriptionStatus.GRACE_PERIOD) {
-          if (subscription.gracePeriodEnd && now > subscription.gracePeriodEnd) {
+          if (
+            subscription.gracePeriodEnd &&
+            now > subscription.gracePeriodEnd
+          ) {
             if (freePlan) {
               subscription.plan = freePlan;
               subscription.status = SubscriptionStatus.ACTIVE;
@@ -79,61 +86,127 @@ export default async function billingRoutes(fastify: FastifyInstance) {
         const planPrice = subscription.plan.getActualPrice();
         const user = subscription.user;
 
-        let discountAmount = 0;
-        let coupon: Coupon | null = null;
+        const couponPlanApplicable =
+          !!globalCoupon &&
+          (globalCoupon.applicablePlans.length === 0 ||
+            globalCoupon.applicablePlans.some(
+              (p) => p.id === subscription.plan.id,
+            ));
 
-        if (globalCoupon && globalCoupon.isUsable()) {
-          if (globalCoupon.applicablePlans.length === 0 ||
-              globalCoupon.applicablePlans.some(p => p.id === subscription.plan.id)) {
-            coupon = globalCoupon;
-            discountAmount = coupon.calculateDiscount(planPrice);
+        // Pre-check using best-case (discounted) amount; final amount is
+        // recomputed inside the transaction once we know whether the shared
+        // coupon could actually be reserved (maxUses may have been hit).
+        const optimisticDiscount =
+          couponPlanApplicable && globalCoupon!.isUsable()
+            ? globalCoupon!.calculateDiscount(planPrice)
+            : 0;
+        const optimisticAmount = Number(
+          (planPrice - optimisticDiscount).toFixed(2),
+        );
+
+        const GRACE_FALLBACK = Symbol("graceFallback");
+        let renewed = false;
+        let graceFallbackAmount = 0;
+
+        if (user.balance >= optimisticAmount) {
+          try {
+            await AppDataSource.transaction(async (manager) => {
+              let coupon: Coupon | null = null;
+              let actualDiscount = 0;
+
+              if (couponPlanApplicable) {
+                // Atomic conditional reservation: only succeeds while
+                // maxUses hasn't been exhausted, preventing oversell even
+                // across concurrent runs.
+                const reserveResult = await manager
+                  .createQueryBuilder()
+                  .update(Coupon)
+                  .set({ usedCount: () => `"usedCount" + 1` })
+                  .where(
+                    `"id" = :id
+                     AND "isActive" = 1
+                     AND ("expiresAt" IS NULL OR "expiresAt" > :now)
+                     AND ("maxUses" = 0 OR "usedCount" < "maxUses")`,
+                    { id: globalCoupon!.id, now },
+                  )
+                  .execute();
+
+                if (reserveResult.affected && reserveResult.affected > 0) {
+                  coupon = globalCoupon;
+                  // Keep the in-memory shared coupon in sync so the next
+                  // iteration's isUsable() check reflects the new count.
+                  globalCoupon!.usedCount++;
+                  actualDiscount = globalCoupon!.calculateDiscount(planPrice);
+                }
+                // If reservation failed, coupon is exhausted -> fall back
+                // to renewing at full price without a discount.
+              }
+
+              const actualAmount = Number(
+                (planPrice - actualDiscount).toFixed(2),
+              );
+
+              // Coupon may have failed to reserve; re-check balance against
+              // the real amount before charging the user.
+              if (user.balance < actualAmount) {
+                graceFallbackAmount = actualAmount;
+                throw GRACE_FALLBACK;
+              }
+
+              user.balance = Number((user.balance - actualAmount).toFixed(2));
+              await manager.save(User, user);
+
+              const bill = billRepository.create({
+                user,
+                subscription,
+                plan: subscription.plan,
+                amount: actualAmount,
+                discountAmount: actualDiscount,
+                coupon,
+                status: BillStatus.PAID,
+                description: `Renewal of ${subscription.plan.name}${actualDiscount > 0 ? ` (discount: ${actualDiscount})` : ""}`,
+                paidAt: now,
+              });
+              await manager.save(bill);
+
+              // Extend the new end date using the CURRENT (paid) plan's
+              // duration first, so users don't get a high-tier period
+              // priced as a low-tier renewal.
+              const renewalBase =
+                subscription.endDate.getTime() > now.getTime()
+                  ? new Date(subscription.endDate)
+                  : new Date(now);
+              renewalBase.setDate(
+                renewalBase.getDate() + subscription.plan.getDurationDays(),
+              );
+              subscription.endDate = renewalBase;
+
+              // Apply any pending downgrade AFTER computing the new end
+              // date; the downgrade only takes effect for the next cycle.
+              if (subscription.pendingDowngradePlanId) {
+                const newPlan = await manager.findOne(Plan, {
+                  where: { id: subscription.pendingDowngradePlanId },
+                });
+                if (newPlan) {
+                  subscription.plan = newPlan;
+                  subscription.pendingDowngradePlanId = null as any;
+                }
+              }
+
+              subscription.status = SubscriptionStatus.ACTIVE;
+              subscription.gracePeriodEnd = null as any;
+              await manager.save(subscription);
+
+              renewed = true;
+            });
+          } catch (err) {
+            if (err !== GRACE_FALLBACK) {
+              throw err;
+            }
           }
         }
 
-        const amount = Number((planPrice - discountAmount).toFixed(2));
-
-        if (user.balance >= amount) {
-          user.balance = Number((user.balance - amount).toFixed(2));
-          await AppDataSource.getRepository("User").save(user);
-
-          const bill = billRepository.create({
-            user,
-            subscription,
-            plan: subscription.plan,
-            amount,
-            discountAmount,
-            coupon,
-            status: BillStatus.PAID,
-            description: `Renewal of ${subscription.plan.name}${discountAmount > 0 ? ` (discount: ${discountAmount})` : ""}`,
-            paidAt: now,
-          });
-
-          await AppDataSource.transaction(async (manager) => {
-            if (coupon) {
-              coupon.usedCount++;
-              await manager.save(coupon);
-            }
-            await manager.save(bill);
-          });
-
-          if (subscription.pendingDowngradePlanId) {
-            const newPlan = await planRepository.findOne({
-              where: { id: subscription.pendingDowngradePlanId },
-            });
-            if (newPlan) {
-              subscription.plan = newPlan;
-              subscription.pendingDowngradePlanId = null as any;
-            }
-          }
-
-          const newEndDate = new Date(subscription.endDate);
-          newEndDate.setDate(
-            newEndDate.getDate() + subscription.plan.getDurationDays()
-          );
-          subscription.endDate = newEndDate;
-          subscription.status = SubscriptionStatus.ACTIVE;
-          subscription.gracePeriodEnd = null as any;
-          await subscriptionRepository.save(subscription);
+        if (renewed) {
           results.renewed++;
         } else {
           subscription.status = SubscriptionStatus.GRACE_PERIOD;
@@ -143,13 +216,15 @@ export default async function billingRoutes(fastify: FastifyInstance) {
 
           await subscriptionRepository.save(subscription);
 
+          const failedAmount =
+            graceFallbackAmount > 0 ? graceFallbackAmount : optimisticAmount;
           const bill = billRepository.create({
             user,
             subscription,
             plan: subscription.plan,
-            amount,
-            discountAmount,
-            coupon,
+            amount: failedAmount,
+            discountAmount: 0,
+            coupon: null,
             status: BillStatus.FAILED,
             description: `Renewal failed - insufficient balance. Grace period until ${graceEnd.toISOString()}`,
           });
@@ -161,7 +236,7 @@ export default async function billingRoutes(fastify: FastifyInstance) {
       }
 
       return results;
-    }
+    },
   );
 
   fastify.get(
@@ -184,7 +259,7 @@ export default async function billingRoutes(fastify: FastifyInstance) {
     async (
       request: FastifyRequest<{
         Querystring: { status?: string; startDate?: string; endDate?: string };
-      }>
+      }>,
     ) => {
       const where: any = { user: { id: request.user.id } };
 
@@ -195,7 +270,7 @@ export default async function billingRoutes(fastify: FastifyInstance) {
       if (request.query.startDate && request.query.endDate) {
         where.createdAt = Between(
           new Date(request.query.startDate),
-          new Date(request.query.endDate)
+          new Date(request.query.endDate),
         );
       }
 
@@ -204,7 +279,7 @@ export default async function billingRoutes(fastify: FastifyInstance) {
         relations: ["plan"],
         order: { createdAt: "DESC" },
       });
-    }
+    },
   );
 
   fastify.get(
@@ -233,7 +308,7 @@ export default async function billingRoutes(fastify: FastifyInstance) {
           startDate?: string;
           endDate?: string;
         };
-      }>
+      }>,
     ) => {
       const where: any = {};
 
@@ -248,7 +323,7 @@ export default async function billingRoutes(fastify: FastifyInstance) {
       if (request.query.startDate && request.query.endDate) {
         where.createdAt = Between(
           new Date(request.query.startDate),
-          new Date(request.query.endDate)
+          new Date(request.query.endDate),
         );
       }
 
@@ -257,6 +332,6 @@ export default async function billingRoutes(fastify: FastifyInstance) {
         relations: ["user", "plan"],
         order: { createdAt: "DESC" },
       });
-    }
+    },
   );
 }
