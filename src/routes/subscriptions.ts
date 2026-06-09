@@ -31,7 +31,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
         relations: ["plan"],
         order: { createdAt: "DESC" },
       });
-    }
+    },
   );
 
   fastify.post(
@@ -55,7 +55,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
     async (
       request: FastifyRequest<{
         Body: { planId: number; autoRenew?: boolean; couponCode?: string };
-      }>
+      }>,
     ) => {
       const { planId, autoRenew = true, couponCode } = request.body;
       const plan = await planRepository.findOne({ where: { id: planId } });
@@ -98,7 +98,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
 
         if (coupon.applicablePlans.length > 0) {
           const planApplicable = coupon.applicablePlans.some(
-            (p) => p.id === planId
+            (p) => p.id === planId,
           );
           if (!planApplicable) {
             throw new Error("Coupon is not applicable to this plan");
@@ -123,7 +123,9 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
 
       await subscriptionRepository.save(subscription);
 
-      const finalAmount = Number((plan.getActualPrice() - discountAmount).toFixed(2));
+      const finalAmount = Number(
+        (plan.getActualPrice() - discountAmount).toFixed(2),
+      );
 
       const bill = billRepository.create({
         user: request.user,
@@ -152,7 +154,9 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
 
         if (user && user.referredBy && !user.hasReceivedFirstReward) {
           const referralPercentage = 10;
-          const rewardAmount = Number(((finalAmount * referralPercentage) / 100).toFixed(2));
+          const rewardAmount = Number(
+            ((finalAmount * referralPercentage) / 100).toFixed(2),
+          );
 
           const referralReward = referralRewardRepository.create({
             referrer: user.referredBy,
@@ -164,7 +168,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
           await manager.save(referralReward);
 
           user.referredBy.balance = Number(
-            (Number(user.referredBy.balance) + rewardAmount).toFixed(2)
+            (Number(user.referredBy.balance) + rewardAmount).toFixed(2),
           );
           await manager.save(user.referredBy);
 
@@ -177,7 +181,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
         where: { id: subscription.id },
         relations: ["plan"],
       });
-    }
+    },
   );
 
   fastify.post(
@@ -206,7 +210,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
       request: FastifyRequest<{
         Params: { id: number };
         Body: { newPlanId: number; couponCode?: string };
-      }>
+      }>,
     ) => {
       const subscription = await subscriptionRepository.findOne({
         where: { id: request.params.id, user: { id: request.user.id } },
@@ -233,13 +237,15 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
       const remainingDays = Math.max(
         0,
         Math.ceil(
-          (subscription.endDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)
-        )
+          (subscription.endDate.getTime() - now.getTime()) /
+            (1000 * 60 * 60 * 24),
+        ),
       );
 
       const oldPlanPrice = subscription.plan.getActualPrice();
       const oldPlanDays = subscription.plan.getDurationDays();
-      const remainingValue = oldPlanPrice * (remainingDays / oldPlanDays);
+      const remainingValue =
+        oldPlanDays > 0 ? oldPlanPrice * (remainingDays / oldPlanDays) : 0;
       const priceDiff = newPlan.getActualPrice() - remainingValue;
 
       if (priceDiff > 0) {
@@ -262,7 +268,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
 
           if (coupon.applicablePlans.length > 0) {
             const planApplicable = coupon.applicablePlans.some(
-              (p) => p.id === newPlan.id
+              (p) => p.id === newPlan.id,
             );
             if (!planApplicable) {
               throw new Error("Coupon is not applicable to this plan");
@@ -297,7 +303,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
 
       subscription.plan = newPlan;
       subscription.endDate = new Date(
-        now.getTime() + newPlan.getDurationDays() * 24 * 60 * 60 * 1000
+        now.getTime() + newPlan.getDurationDays() * 24 * 60 * 60 * 1000,
       );
 
       await subscriptionRepository.save(subscription);
@@ -306,7 +312,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
         where: { id: subscription.id },
         relations: ["plan"],
       });
-    }
+    },
   );
 
   fastify.post(
@@ -332,7 +338,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
       request: FastifyRequest<{
         Params: { id: number };
         Body: { newPlanId: number };
-      }>
+      }>,
     ) => {
       const subscription = await subscriptionRepository.findOne({
         where: { id: request.params.id, user: { id: request.user.id } },
@@ -357,7 +363,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
       return {
         message: `Downgrade scheduled. Will take effect on ${subscription.endDate.toISOString()}`,
       };
-    }
+    },
   );
 
   fastify.post(
@@ -374,9 +380,7 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
         },
       },
     },
-    async (
-      request: FastifyRequest<{ Params: { id: number } }>
-    ) => {
+    async (request: FastifyRequest<{ Params: { id: number } }>) => {
       const subscription = await subscriptionRepository.findOne({
         where: { id: request.params.id, user: { id: request.user.id } },
       });
@@ -389,6 +393,6 @@ export default async function subscriptionRoutes(fastify: FastifyInstance) {
       await subscriptionRepository.save(subscription);
 
       return { message: "Auto-renew cancelled" };
-    }
+    },
   );
 }
