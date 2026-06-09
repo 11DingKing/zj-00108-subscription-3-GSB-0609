@@ -4,6 +4,7 @@ import { Subscription, SubscriptionStatus } from "../entities/Subscription";
 import { Bill, BillStatus } from "../entities/Bill";
 import { Plan, PlanType } from "../entities/Plan";
 import { Coupon } from "../entities/Coupon";
+import { User } from "../entities/User";
 import { In, LessThan, MoreThan, Between } from "typeorm";
 
 export default async function billingRoutes(fastify: FastifyInstance) {
@@ -35,7 +36,10 @@ export default async function billingRoutes(fastify: FastifyInstance) {
         where: {
           endDate: LessThan(now),
           autoRenew: true,
-          status: In([SubscriptionStatus.ACTIVE, SubscriptionStatus.GRACE_PERIOD]),
+          status: In([
+            SubscriptionStatus.ACTIVE,
+            SubscriptionStatus.GRACE_PERIOD,
+          ]),
         },
         relations: ["user", "plan"],
       });
@@ -61,7 +65,10 @@ export default async function billingRoutes(fastify: FastifyInstance) {
 
       for (const subscription of expiredSubscriptions) {
         if (subscription.status === SubscriptionStatus.GRACE_PERIOD) {
-          if (subscription.gracePeriodEnd && now > subscription.gracePeriodEnd) {
+          if (
+            subscription.gracePeriodEnd &&
+            now > subscription.gracePeriodEnd
+          ) {
             if (freePlan) {
               subscription.plan = freePlan;
               subscription.status = SubscriptionStatus.ACTIVE;
@@ -83,8 +90,12 @@ export default async function billingRoutes(fastify: FastifyInstance) {
         let coupon: Coupon | null = null;
 
         if (globalCoupon && globalCoupon.isUsable()) {
-          if (globalCoupon.applicablePlans.length === 0 ||
-              globalCoupon.applicablePlans.some(p => p.id === subscription.plan.id)) {
+          if (
+            globalCoupon.applicablePlans.length === 0 ||
+            globalCoupon.applicablePlans.some(
+              (p) => p.id === subscription.plan.id,
+            )
+          ) {
             coupon = globalCoupon;
             discountAmount = coupon.calculateDiscount(planPrice);
           }
@@ -93,47 +104,57 @@ export default async function billingRoutes(fastify: FastifyInstance) {
         const amount = Number((planPrice - discountAmount).toFixed(2));
 
         if (user.balance >= amount) {
-          user.balance = Number((user.balance - amount).toFixed(2));
-          await AppDataSource.getRepository("User").save(user);
-
-          const bill = billRepository.create({
-            user,
-            subscription,
-            plan: subscription.plan,
-            amount,
-            discountAmount,
-            coupon,
-            status: BillStatus.PAID,
-            description: `Renewal of ${subscription.plan.name}${discountAmount > 0 ? ` (discount: ${discountAmount})` : ""}`,
-            paidAt: now,
-          });
-
           await AppDataSource.transaction(async (manager) => {
             if (coupon) {
-              coupon.usedCount++;
-              await manager.save(coupon);
+              const freshCoupon = await manager.findOne(Coupon, {
+                where: { id: coupon.id },
+                relations: ["applicablePlans"],
+              });
+              if (!freshCoupon || !freshCoupon.isUsable()) {
+                throw new Error("Coupon is no longer usable");
+              }
+              freshCoupon.usedCount++;
+              await manager.save(freshCoupon);
             }
-            await manager.save(bill);
-          });
 
-          if (subscription.pendingDowngradePlanId) {
-            const newPlan = await planRepository.findOne({
-              where: { id: subscription.pendingDowngradePlanId },
+            user.balance = Number((user.balance - amount).toFixed(2));
+            await manager.save(User, user);
+
+            const bill = billRepository.create({
+              user,
+              subscription,
+              plan: subscription.plan,
+              amount,
+              discountAmount,
+              coupon,
+              status: BillStatus.PAID,
+              description: `Renewal of ${subscription.plan.name}${discountAmount > 0 ? ` (discount: ${discountAmount})` : ""}`,
+              paidAt: now,
             });
-            if (newPlan) {
-              subscription.plan = newPlan;
-              subscription.pendingDowngradePlanId = null as any;
-            }
-          }
+            await manager.save(bill);
 
-          const newEndDate = new Date(subscription.endDate);
-          newEndDate.setDate(
-            newEndDate.getDate() + subscription.plan.getDurationDays()
-          );
-          subscription.endDate = newEndDate;
-          subscription.status = SubscriptionStatus.ACTIVE;
-          subscription.gracePeriodEnd = null as any;
-          await subscriptionRepository.save(subscription);
+            if (subscription.pendingDowngradePlanId) {
+              const newPlan = await manager.findOne(Plan, {
+                where: { id: subscription.pendingDowngradePlanId },
+              });
+              if (newPlan) {
+                subscription.plan = newPlan;
+                subscription.pendingDowngradePlanId = null as any;
+              }
+            }
+
+            const renewalBase =
+              subscription.endDate.getTime() > now.getTime()
+                ? new Date(subscription.endDate)
+                : new Date(now);
+            renewalBase.setDate(
+              renewalBase.getDate() + subscription.plan.getDurationDays(),
+            );
+            subscription.endDate = renewalBase;
+            subscription.status = SubscriptionStatus.ACTIVE;
+            subscription.gracePeriodEnd = null as any;
+            await manager.save(subscription);
+          });
           results.renewed++;
         } else {
           subscription.status = SubscriptionStatus.GRACE_PERIOD;
@@ -161,7 +182,7 @@ export default async function billingRoutes(fastify: FastifyInstance) {
       }
 
       return results;
-    }
+    },
   );
 
   fastify.get(
@@ -184,7 +205,7 @@ export default async function billingRoutes(fastify: FastifyInstance) {
     async (
       request: FastifyRequest<{
         Querystring: { status?: string; startDate?: string; endDate?: string };
-      }>
+      }>,
     ) => {
       const where: any = { user: { id: request.user.id } };
 
@@ -195,7 +216,7 @@ export default async function billingRoutes(fastify: FastifyInstance) {
       if (request.query.startDate && request.query.endDate) {
         where.createdAt = Between(
           new Date(request.query.startDate),
-          new Date(request.query.endDate)
+          new Date(request.query.endDate),
         );
       }
 
@@ -204,7 +225,7 @@ export default async function billingRoutes(fastify: FastifyInstance) {
         relations: ["plan"],
         order: { createdAt: "DESC" },
       });
-    }
+    },
   );
 
   fastify.get(
@@ -233,7 +254,7 @@ export default async function billingRoutes(fastify: FastifyInstance) {
           startDate?: string;
           endDate?: string;
         };
-      }>
+      }>,
     ) => {
       const where: any = {};
 
@@ -248,7 +269,7 @@ export default async function billingRoutes(fastify: FastifyInstance) {
       if (request.query.startDate && request.query.endDate) {
         where.createdAt = Between(
           new Date(request.query.startDate),
-          new Date(request.query.endDate)
+          new Date(request.query.endDate),
         );
       }
 
@@ -257,6 +278,6 @@ export default async function billingRoutes(fastify: FastifyInstance) {
         relations: ["user", "plan"],
         order: { createdAt: "DESC" },
       });
-    }
+    },
   );
 }
