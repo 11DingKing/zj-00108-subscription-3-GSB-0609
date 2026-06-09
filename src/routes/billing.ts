@@ -164,27 +164,26 @@ export default async function billingRoutes(fastify: FastifyInstance) {
               });
               await billRepo.save(bill);
 
-              let newPlan = originalPlan;
-              if (subscription.pendingDowngradePlanId) {
-                const foundPlan = await manager.getRepository(Plan).findOne({
-                  where: { id: subscription.pendingDowngradePlanId },
-                });
-                if (foundPlan) {
-                  newPlan = foundPlan;
-                  subscription.pendingDowngradePlanId = null as any;
-                }
-              }
-
               const baseDate = new Date(
                 Math.max(now.getTime(), subscription.endDate.getTime()),
               );
               const newEndDate = new Date(baseDate);
               newEndDate.setDate(
-                newEndDate.getDate() + newPlan.getDurationDays(),
+                newEndDate.getDate() + originalPlan.getDurationDays(),
               );
-
-              subscription.plan = newPlan;
               subscription.endDate = newEndDate;
+
+              if (subscription.pendingDowngradePlanId) {
+                const foundPlan = await manager.getRepository(Plan).findOne({
+                  where: { id: subscription.pendingDowngradePlanId },
+                });
+                if (foundPlan) {
+                  subscription.plan = foundPlan;
+                  subscription.pendingDowngradePlanId = null as any;
+                }
+              } else {
+                subscription.plan = originalPlan;
+              }
               subscription.status = SubscriptionStatus.ACTIVE;
               subscription.gracePeriodEnd = null as any;
               await subRepo.save(subscription);
