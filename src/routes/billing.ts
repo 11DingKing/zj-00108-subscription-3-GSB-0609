@@ -4,6 +4,7 @@ import { Subscription, SubscriptionStatus } from "../entities/Subscription";
 import { Bill, BillStatus } from "../entities/Bill";
 import { Plan, PlanType } from "../entities/Plan";
 import { Coupon } from "../entities/Coupon";
+import { User } from "../entities/User";
 import { In, LessThan, MoreThan, Between } from "typeorm";
 
 export default async function billingRoutes(fastify: FastifyInstance) {
@@ -62,102 +63,120 @@ export default async function billingRoutes(fastify: FastifyInstance) {
       for (const subscription of expiredSubscriptions) {
         if (subscription.status === SubscriptionStatus.GRACE_PERIOD) {
           if (subscription.gracePeriodEnd && now > subscription.gracePeriodEnd) {
-            if (freePlan) {
-              subscription.plan = freePlan;
-              subscription.status = SubscriptionStatus.ACTIVE;
-              subscription.autoRenew = false;
-            } else {
-              subscription.status = SubscriptionStatus.EXPIRED;
-            }
-            subscription.gracePeriodEnd = null as any;
-            await subscriptionRepository.save(subscription);
+            await AppDataSource.transaction(async (manager) => {
+              if (freePlan) {
+                subscription.plan = freePlan;
+                subscription.status = SubscriptionStatus.ACTIVE;
+                subscription.autoRenew = false;
+              } else {
+                subscription.status = SubscriptionStatus.EXPIRED;
+              }
+              subscription.gracePeriodEnd = null as any;
+              await manager.save(subscription);
+            });
             results.downgraded++;
           }
           continue;
         }
 
         const planPrice = subscription.plan.getActualPrice();
-        const user = subscription.user;
 
-        let discountAmount = 0;
-        let coupon: Coupon | null = null;
-
-        if (globalCoupon && globalCoupon.isUsable()) {
-          if (globalCoupon.applicablePlans.length === 0 ||
-              globalCoupon.applicablePlans.some(p => p.id === subscription.plan.id)) {
-            coupon = globalCoupon;
-            discountAmount = coupon.calculateDiscount(planPrice);
-          }
-        }
-
-        const amount = Number((planPrice - discountAmount).toFixed(2));
-
-        if (user.balance >= amount) {
-          user.balance = Number((user.balance - amount).toFixed(2));
-          await AppDataSource.getRepository("User").save(user);
-
-          const bill = billRepository.create({
-            user,
-            subscription,
-            plan: subscription.plan,
-            amount,
-            discountAmount,
-            coupon,
-            status: BillStatus.PAID,
-            description: `Renewal of ${subscription.plan.name}${discountAmount > 0 ? ` (discount: ${discountAmount})` : ""}`,
-            paidAt: now,
+        await AppDataSource.transaction(async (manager) => {
+          const user = await manager.findOne(User, {
+            where: { id: subscription.user.id },
           });
+          if (!user) return;
 
-          await AppDataSource.transaction(async (manager) => {
+          let discountAmount = 0;
+          let coupon: Coupon | null = null;
+
+          if (globalCoupon) {
+            const freshCoupon = await manager.findOne(Coupon, {
+              where: { id: globalCoupon.id },
+              relations: ["applicablePlans"],
+            });
+            if (freshCoupon && freshCoupon.isUsable()) {
+              if (
+                freshCoupon.applicablePlans.length === 0 ||
+                freshCoupon.applicablePlans.some(
+                  (p) => p.id === subscription.plan.id
+                )
+              ) {
+                coupon = freshCoupon;
+                discountAmount = coupon.calculateDiscount(planPrice);
+              }
+            }
+          }
+
+          const amount = Number((planPrice - discountAmount).toFixed(2));
+
+          if (user.balance >= amount) {
+            user.balance = Number((user.balance - amount).toFixed(2));
+            await manager.save(user);
+
             if (coupon) {
               coupon.usedCount++;
               await manager.save(coupon);
+              globalCoupon!.usedCount = coupon.usedCount;
             }
-            await manager.save(bill);
-          });
 
-          if (subscription.pendingDowngradePlanId) {
-            const newPlan = await planRepository.findOne({
-              where: { id: subscription.pendingDowngradePlanId },
+            const bill = manager.create(Bill, {
+              user,
+              subscription,
+              plan: subscription.plan,
+              amount,
+              discountAmount,
+              coupon,
+              status: BillStatus.PAID,
+              description: `Renewal of ${subscription.plan.name}${discountAmount > 0 ? ` (discount: ${discountAmount})` : ""}`,
+              paidAt: now,
             });
-            if (newPlan) {
-              subscription.plan = newPlan;
-              subscription.pendingDowngradePlanId = null as any;
+            await manager.save(bill);
+
+            const baseDate = new Date(
+              Math.max(now.getTime(), subscription.endDate.getTime())
+            );
+            const newEndDate = new Date(baseDate);
+            newEndDate.setDate(
+              newEndDate.getDate() + subscription.plan.getDurationDays()
+            );
+
+            if (subscription.pendingDowngradePlanId) {
+              const newPlan = await manager.findOne(Plan, {
+                where: { id: subscription.pendingDowngradePlanId },
+              });
+              if (newPlan) {
+                subscription.plan = newPlan;
+                subscription.pendingDowngradePlanId = null as any;
+              }
             }
+
+            subscription.endDate = newEndDate;
+            subscription.status = SubscriptionStatus.ACTIVE;
+            subscription.gracePeriodEnd = null as any;
+            await manager.save(subscription);
+            results.renewed++;
+          } else {
+            subscription.status = SubscriptionStatus.GRACE_PERIOD;
+            const graceEnd = new Date(now);
+            graceEnd.setDate(graceEnd.getDate() + gracePeriodDays);
+            subscription.gracePeriodEnd = graceEnd;
+            await manager.save(subscription);
+
+            const bill = manager.create(Bill, {
+              user,
+              subscription,
+              plan: subscription.plan,
+              amount,
+              discountAmount,
+              status: BillStatus.FAILED,
+              description: `Renewal failed - insufficient balance. Grace period until ${graceEnd.toISOString()}`,
+            });
+            await manager.save(bill);
+            results.failed++;
+            results.gracePeriod++;
           }
-
-          const newEndDate = new Date(subscription.endDate);
-          newEndDate.setDate(
-            newEndDate.getDate() + subscription.plan.getDurationDays()
-          );
-          subscription.endDate = newEndDate;
-          subscription.status = SubscriptionStatus.ACTIVE;
-          subscription.gracePeriodEnd = null as any;
-          await subscriptionRepository.save(subscription);
-          results.renewed++;
-        } else {
-          subscription.status = SubscriptionStatus.GRACE_PERIOD;
-          const graceEnd = new Date(now);
-          graceEnd.setDate(graceEnd.getDate() + gracePeriodDays);
-          subscription.gracePeriodEnd = graceEnd;
-
-          await subscriptionRepository.save(subscription);
-
-          const bill = billRepository.create({
-            user,
-            subscription,
-            plan: subscription.plan,
-            amount,
-            discountAmount,
-            coupon,
-            status: BillStatus.FAILED,
-            description: `Renewal failed - insufficient balance. Grace period until ${graceEnd.toISOString()}`,
-          });
-          await billRepository.save(bill);
-
-          results.failed++;
-          results.gracePeriod++;
-        }
+        });
       }
 
       return results;
